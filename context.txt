@@ -1,0 +1,4725 @@
+.
+├── .devcontainer
+│   ├── devcontainer.json
+│   └── post-install.sh
+├── .dockerignore
+├── .github
+│   └── workflows
+│       ├── lint.yml
+│       ├── test-chart.yml
+│       ├── test-e2e.yml
+│       └── test.yml
+├── .gitignore
+├── .golangci.yml
+├── Dockerfile
+├── Makefile
+├── PROJECT
+├── README.md
+├── api
+│   └── v1
+│       ├── groupversion_info.go
+│       ├── webapp_types.go
+│       └── zz_generated.deepcopy.go
+├── cmd
+│   └── main.go
+├── config
+│   ├── crd
+│   │   ├── bases
+│   │   │   └── kleff.kleff.io_webapps.yaml
+│   │   ├── kustomization.yaml
+│   │   └── kustomizeconfig.yaml
+│   ├── default
+│   │   ├── cert_metrics_manager_patch.yaml
+│   │   ├── kustomization.yaml
+│   │   ├── manager_metrics_patch.yaml
+│   │   └── metrics_service.yaml
+│   ├── manager
+│   │   ├── kustomization.yaml
+│   │   └── manager.yaml
+│   ├── network-policy
+│   │   ├── allow-metrics-traffic.yaml
+│   │   └── kustomization.yaml
+│   ├── prometheus
+│   │   ├── kustomization.yaml
+│   │   ├── monitor.yaml
+│   │   └── monitor_tls_patch.yaml
+│   ├── rbac
+│   │   ├── kustomization.yaml
+│   │   ├── leader_election_role.yaml
+│   │   ├── leader_election_role_binding.yaml
+│   │   ├── metrics_auth_role.yaml
+│   │   ├── metrics_auth_role_binding.yaml
+│   │   ├── metrics_reader_role.yaml
+│   │   ├── role.yaml
+│   │   ├── role_binding.yaml
+│   │   ├── service_account.yaml
+│   │   ├── webapp_admin_role.yaml
+│   │   ├── webapp_editor_role.yaml
+│   │   └── webapp_viewer_role.yaml
+│   └── samples
+│       ├── kleff_v1_webapp.yaml
+│       └── kustomization.yaml
+├── context.txt
+├── dist
+│   ├── chart
+│   │   ├── .helmignore
+│   │   ├── Chart.yaml
+│   │   ├── templates
+│   │   │   ├── _helpers.tpl
+│   │   │   ├── crd
+│   │   │   │   └── webapps.kleff.kleff.io.yaml
+│   │   │   ├── manager
+│   │   │   │   └── manager.yaml
+│   │   │   ├── metrics
+│   │   │   │   └── controller-manager-metrics-service.yaml
+│   │   │   ├── monitoring
+│   │   │   │   └── servicemonitor.yaml
+│   │   │   └── rbac
+│   │   │       ├── controller-manager.yaml
+│   │   │       ├── leader-election-role.yaml
+│   │   │       ├── leader-election-rolebinding.yaml
+│   │   │       ├── manager-role.yaml
+│   │   │       ├── manager-rolebinding.yaml
+│   │   │       ├── metrics-auth-role.yaml
+│   │   │       ├── metrics-auth-rolebinding.yaml
+│   │   │       ├── metrics-reader.yaml
+│   │   │       ├── webapp-admin-role.yaml
+│   │   │       ├── webapp-editor-role.yaml
+│   │   │       └── webapp-viewer-role.yaml
+│   │   └── values.yaml
+│   └── install.yaml
+├── get_helm.sh
+├── go.mod
+├── go.sum
+├── hack
+│   └── boilerplate.go.txt
+├── internal
+│   └── controller
+│       ├── suite_test.go
+│       ├── webapp_controller.go
+│       └── webapp_controller_test.go
+├── operator-0.1.0.tgz
+└── test
+    ├── e2e
+    │   ├── e2e_suite_test.go
+    │   └── e2e_test.go
+    └── utils
+        └── utils.go
+
+30 directories, 77 files
+
+
+================================================================================
+FILE: ./cmd/main.go
+================================================================================
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"crypto/tls"
+	"flag"
+	"os"
+
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	kleffv1 "kleff.io/api/v1"
+	"kleff.io/internal/controller"
+	// +kubebuilder:scaffold:imports
+)
+
+var (
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+
+	utilruntime.Must(kleffv1.AddToScheme(scheme))
+
+	// ADD THIS HERE: Register Istio types before the manager starts
+	utilruntime.Must(gatewayv1.AddToScheme(scheme))
+	// +kubebuilder:scaffold:scheme
+}
+
+// nolint:gocyclo
+func main() {
+	var metricsAddr string
+	var metricsCertPath, metricsCertName, metricsCertKey string
+	var webhookCertPath, webhookCertName, webhookCertKey string
+	var enableLeaderElection bool
+	var probeAddr string
+	var secureMetrics bool
+	var enableHTTP2 bool
+	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
+		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", true,
+		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
+	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
+	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
+	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
+		"The directory that contains the metrics server certificate.")
+	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
+	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
+	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	opts := zap.Options{
+		Development: true,
+	}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// if the enable-http2 flag is false (the default), http/2 should be disabled
+	// due to its vulnerabilities. More specifically, disabling http/2 will
+	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
+	// Rapid Reset CVEs. For more information see:
+	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
+	// - https://github.com/advisories/GHSA-4374-p667-p6c8
+	disableHTTP2 := func(c *tls.Config) {
+		setupLog.Info("disabling http/2")
+		c.NextProtos = []string{"http/1.1"}
+	}
+
+	if !enableHTTP2 {
+		tlsOpts = append(tlsOpts, disableHTTP2)
+	}
+
+	// Initial webhook TLS options
+	webhookTLSOpts := tlsOpts
+	webhookServerOptions := webhook.Options{
+		TLSOpts: webhookTLSOpts,
+	}
+
+	if len(webhookCertPath) > 0 {
+		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
+			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
+
+		webhookServerOptions.CertDir = webhookCertPath
+		webhookServerOptions.CertName = webhookCertName
+		webhookServerOptions.KeyName = webhookCertKey
+	}
+
+	webhookServer := webhook.NewServer(webhookServerOptions)
+
+	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
+	// More info:
+	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/metrics/server
+	// - https://book.kubebuilder.io/reference/metrics.html
+	metricsServerOptions := metricsserver.Options{
+		BindAddress:   metricsAddr,
+		SecureServing: secureMetrics,
+		TLSOpts:       tlsOpts,
+	}
+
+	if secureMetrics {
+		// FilterProvider is used to protect the metrics endpoint with authn/authz.
+		// These configurations ensure that only authorized users and service accounts
+		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
+		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/metrics/filters#WithAuthenticationAndAuthorization
+		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+
+	// If the certificate is not specified, controller-runtime will automatically
+	// generate self-signed certificates for the metrics server. While convenient for development and testing,
+	// this setup is not recommended for production.
+	//
+	// TODO(user): If you enable certManager, uncomment the following lines:
+	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
+	// managed by cert-manager for the metrics server.
+	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
+	if len(metricsCertPath) > 0 {
+		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
+			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
+
+		metricsServerOptions.CertDir = metricsCertPath
+		metricsServerOptions.CertName = metricsCertName
+		metricsServerOptions.KeyName = metricsCertKey
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsServerOptions,
+		WebhookServer:          webhookServer,
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       "c4117f5d.kleff.io",
+		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
+		// when the Manager ends. This requires the binary to immediately end when the
+		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
+		// speeds up voluntary leader transitions as the new leader don't have to wait
+		// LeaseDuration time first.
+		//
+		// In the default scaffold provided, the program ends immediately after
+		// the manager stops, so would be fine to enable this option. However,
+		// if you are doing or is intended to do any operation such as perform cleanups
+		// after the manager stops then its usage might be unsafe.
+		// LeaderElectionReleaseOnCancel: true,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	if err := (&controller.WebAppReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WebApp")
+		os.Exit(1)
+	}
+	// +kubebuilder:scaffold:builder
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	setupLog.Info("starting manager")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+
+}
+
+
+================================================================================
+FILE: ./go.mod
+================================================================================
+
+module kleff.io
+
+go 1.24.6
+
+require (
+	github.com/onsi/ginkgo/v2 v2.22.0
+	github.com/onsi/gomega v1.36.1
+	istio.io/client-go v1.28.1
+	k8s.io/api v0.34.1
+	k8s.io/apimachinery v0.34.1
+	k8s.io/client-go v0.34.1
+	sigs.k8s.io/controller-runtime v0.22.4
+	sigs.k8s.io/gateway-api v1.1.0
+)
+
+require (
+	cel.dev/expr v0.24.0 // indirect
+	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/blang/semver/v4 v4.0.0 // indirect
+	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
+	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
+	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
+	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-logr/zapr v1.3.0 // indirect
+	github.com/go-openapi/jsonpointer v0.21.0 // indirect
+	github.com/go-openapi/jsonreference v0.21.0 // indirect
+	github.com/go-openapi/swag v0.23.0 // indirect
+	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/btree v1.1.3 // indirect
+	github.com/google/cel-go v0.26.0 // indirect
+	github.com/google/gnostic-models v0.7.0 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/pprof v0.0.0-20241029153458-d1b30febd7db // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/josharian/intern v1.0.0 // indirect
+	github.com/json-iterator/go v1.1.12 // indirect
+	github.com/mailru/easyjson v0.7.7 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/prometheus/client_golang v1.22.0 // indirect
+	github.com/prometheus/client_model v0.6.1 // indirect
+	github.com/prometheus/common v0.62.0 // indirect
+	github.com/prometheus/procfs v0.15.1 // indirect
+	github.com/spf13/cobra v1.9.1 // indirect
+	github.com/spf13/pflag v1.0.6 // indirect
+	github.com/stoewer/go-strcase v1.3.0 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.58.0 // indirect
+	go.opentelemetry.io/otel v1.36.0 // indirect
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.34.0 // indirect
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.34.0 // indirect
+	go.opentelemetry.io/otel/metric v1.36.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.36.0 // indirect
+	go.opentelemetry.io/otel/trace v1.36.0 // indirect
+	go.opentelemetry.io/proto/otlp v1.5.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.uber.org/zap v1.27.0 // indirect
+	go.yaml.in/yaml/v2 v2.4.2 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
+	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/oauth2 v0.30.0 // indirect
+	golang.org/x/sync v0.16.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/term v0.34.0 // indirect
+	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/time v0.9.0 // indirect
+	golang.org/x/tools v0.35.0 // indirect
+	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20250811230008-5f3141c8851a // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20250811230008-5f3141c8851a // indirect
+	google.golang.org/grpc v1.74.2 // indirect
+	google.golang.org/protobuf v1.36.7 // indirect
+	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+	istio.io/api v1.28.1 // indirect
+	k8s.io/apiextensions-apiserver v0.34.1 // indirect
+	k8s.io/apiserver v0.34.1 // indirect
+	k8s.io/component-base v0.34.1 // indirect
+	k8s.io/klog/v2 v2.130.1 // indirect
+	k8s.io/kube-openapi v0.0.0-20250710124328-f3f2b991d03b // indirect
+	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397 // indirect
+	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2 // indirect
+	sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8 // indirect
+	sigs.k8s.io/randfill v1.0.0 // indirect
+	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
+	sigs.k8s.io/yaml v1.6.0 // indirect
+)
+
+
+================================================================================
+FILE: ./test/utils/utils.go
+================================================================================
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package utils
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
+)
+
+const (
+	certmanagerVersion = "v1.19.1"
+	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+
+	defaultKindBinary  = "kind"
+	defaultKindCluster = "kind"
+)
+
+func warnError(err error) {
+	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
+}
+
+// Run executes the provided command within this context
+func Run(cmd *exec.Cmd) (string, error) {
+	dir, _ := GetProjectDir()
+	cmd.Dir = dir
+
+	if err := os.Chdir(cmd.Dir); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %q\n", err)
+	}
+
+	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	command := strings.Join(cmd.Args, " ")
+	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("%q failed with error %q: %w", command, string(output), err)
+	}
+
+	return string(output), nil
+}
+
+// UninstallCertManager uninstalls the cert manager
+func UninstallCertManager() {
+	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	cmd := exec.Command("kubectl", "delete", "-f", url)
+	if _, err := Run(cmd); err != nil {
+		warnError(err)
+	}
+
+	// Delete leftover leases in kube-system (not cleaned by default)
+	kubeSystemLeases := []string{
+		"cert-manager-cainjector-leader-election",
+		"cert-manager-controller",
+	}
+	for _, lease := range kubeSystemLeases {
+		cmd = exec.Command("kubectl", "delete", "lease", lease,
+			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
+		if _, err := Run(cmd); err != nil {
+			warnError(err)
+		}
+	}
+}
+
+// InstallCertManager installs the cert manager bundle.
+func InstallCertManager() error {
+	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	cmd := exec.Command("kubectl", "apply", "-f", url)
+	if _, err := Run(cmd); err != nil {
+		return err
+	}
+	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
+	// was re-installed after uninstalling on a cluster.
+	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
+		"--for", "condition=Available",
+		"--namespace", "cert-manager",
+		"--timeout", "5m",
+	)
+
+	_, err := Run(cmd)
+	return err
+}
+
+// IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
+// by verifying the existence of key CRDs related to Cert Manager.
+func IsCertManagerCRDsInstalled() bool {
+	// List of common Cert Manager CRDs
+	certManagerCRDs := []string{
+		"certificates.cert-manager.io",
+		"issuers.cert-manager.io",
+		"clusterissuers.cert-manager.io",
+		"certificaterequests.cert-manager.io",
+		"orders.acme.cert-manager.io",
+		"challenges.acme.cert-manager.io",
+	}
+
+	// Execute the kubectl command to get all CRDs
+	cmd := exec.Command("kubectl", "get", "crds")
+	output, err := Run(cmd)
+	if err != nil {
+		return false
+	}
+
+	// Check if any of the Cert Manager CRDs are present
+	crdList := GetNonEmptyLines(output)
+	for _, crd := range certManagerCRDs {
+		for _, line := range crdList {
+			if strings.Contains(line, crd) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// LoadImageToKindClusterWithName loads a local docker image to the kind cluster
+func LoadImageToKindClusterWithName(name string) error {
+	cluster := defaultKindCluster
+	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
+		cluster = v
+	}
+	kindOptions := []string{"load", "docker-image", name, "--name", cluster}
+	kindBinary := defaultKindBinary
+	if v, ok := os.LookupEnv("KIND"); ok {
+		kindBinary = v
+	}
+	cmd := exec.Command(kindBinary, kindOptions...)
+	_, err := Run(cmd)
+	return err
+}
+
+// GetNonEmptyLines converts given command output string into individual objects
+// according to line breakers, and ignores the empty elements in it.
+func GetNonEmptyLines(output string) []string {
+	var res []string
+	elements := strings.Split(output, "\n")
+	for _, element := range elements {
+		if element != "" {
+			res = append(res, element)
+		}
+	}
+
+	return res
+}
+
+// GetProjectDir will return the directory where the project is
+func GetProjectDir() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return wd, fmt.Errorf("failed to get current working directory: %w", err)
+	}
+	wd = strings.ReplaceAll(wd, "/test/e2e", "")
+	return wd, nil
+}
+
+// UncommentCode searches for target in the file and remove the comment prefix
+// of the target content. The target content may span multiple lines.
+func UncommentCode(filename, target, prefix string) error {
+	// false positive
+	// nolint:gosec
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read file %q: %w", filename, err)
+	}
+	strContent := string(content)
+
+	idx := strings.Index(strContent, target)
+	if idx < 0 {
+		return fmt.Errorf("unable to find the code %q to be uncomment", target)
+	}
+
+	out := new(bytes.Buffer)
+	_, err = out.Write(content[:idx])
+	if err != nil {
+		return fmt.Errorf("failed to write to output: %w", err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewBufferString(target))
+	if !scanner.Scan() {
+		return nil
+	}
+	for {
+		if _, err = out.WriteString(strings.TrimPrefix(scanner.Text(), prefix)); err != nil {
+			return fmt.Errorf("failed to write to output: %w", err)
+		}
+		// Avoid writing a newline in case the previous line was the last in target.
+		if !scanner.Scan() {
+			break
+		}
+		if _, err = out.WriteString("\n"); err != nil {
+			return fmt.Errorf("failed to write to output: %w", err)
+		}
+	}
+
+	if _, err = out.Write(content[idx+len(target):]); err != nil {
+		return fmt.Errorf("failed to write to output: %w", err)
+	}
+
+	// false positive
+	// nolint:gosec
+	if err = os.WriteFile(filename, out.Bytes(), 0644); err != nil {
+		return fmt.Errorf("failed to write file %q: %w", filename, err)
+	}
+
+	return nil
+}
+
+
+================================================================================
+FILE: ./test/e2e/e2e_test.go
+================================================================================
+
+//go:build e2e
+// +build e2e
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"kleff.io/test/utils"
+)
+
+// namespace where the project is deployed in
+const namespace = "operator-system"
+
+// serviceAccountName created for the project
+const serviceAccountName = "operator-controller-manager"
+
+// metricsServiceName is the name of the metrics service of the project
+const metricsServiceName = "operator-controller-manager-metrics-service"
+
+// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
+const metricsRoleBindingName = "operator-metrics-binding"
+
+var _ = Describe("Manager", Ordered, func() {
+	var controllerPodName string
+
+	// Before running the tests, set up the environment by creating the namespace,
+	// enforce the restricted security policy to the namespace, installing CRDs,
+	// and deploying the controller.
+	BeforeAll(func() {
+		By("creating manager namespace")
+		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+
+		By("labeling the namespace to enforce the restricted security policy")
+		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+			"pod-security.kubernetes.io/enforce=restricted")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+
+		By("installing CRDs")
+		cmd = exec.Command("make", "install")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+
+		By("deploying the controller-manager")
+		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+	})
+
+	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
+	// and deleting the namespace.
+	AfterAll(func() {
+		By("cleaning up the curl pod for metrics")
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		_, _ = utils.Run(cmd)
+
+		By("undeploying the controller-manager")
+		cmd = exec.Command("make", "undeploy")
+		_, _ = utils.Run(cmd)
+
+		By("uninstalling CRDs")
+		cmd = exec.Command("make", "uninstall")
+		_, _ = utils.Run(cmd)
+
+		By("removing manager namespace")
+		cmd = exec.Command("kubectl", "delete", "ns", namespace)
+		_, _ = utils.Run(cmd)
+	})
+
+	// After each test, check for failures and collect logs, events,
+	// and pod descriptions for debugging.
+	AfterEach(func() {
+		specReport := CurrentSpecReport()
+		if specReport.Failed() {
+			By("Fetching controller manager pod logs")
+			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
+			controllerLogs, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
+			}
+
+			By("Fetching Kubernetes events")
+			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
+			eventsOutput, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
+			}
+
+			By("Fetching curl-metrics logs")
+			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
+			metricsOutput, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
+			}
+
+			By("Fetching controller manager pod description")
+			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
+			podDescription, err := utils.Run(cmd)
+			if err == nil {
+				fmt.Println("Pod description:\n", podDescription)
+			} else {
+				fmt.Println("Failed to describe controller pod")
+			}
+		}
+	})
+
+	SetDefaultEventuallyTimeout(2 * time.Minute)
+	SetDefaultEventuallyPollingInterval(time.Second)
+
+	Context("Manager", func() {
+		It("should run successfully", func() {
+			By("validating that the controller-manager pod is running as expected")
+			verifyControllerUp := func(g Gomega) {
+				// Get the name of the controller-manager pod
+				cmd := exec.Command("kubectl", "get",
+					"pods", "-l", "control-plane=controller-manager",
+					"-o", "go-template={{ range .items }}"+
+						"{{ if not .metadata.deletionTimestamp }}"+
+						"{{ .metadata.name }}"+
+						"{{ \"\\n\" }}{{ end }}{{ end }}",
+					"-n", namespace,
+				)
+
+				podOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
+				podNames := utils.GetNonEmptyLines(podOutput)
+				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
+				controllerPodName = podNames[0]
+				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+
+				// Validate the pod's status
+				cmd = exec.Command("kubectl", "get",
+					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
+					"-n", namespace,
+				)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
+			}
+			Eventually(verifyControllerUp).Should(Succeed())
+		})
+
+		It("should ensure the metrics endpoint is serving metrics", func() {
+			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
+			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+				"--clusterrole=operator-metrics-reader",
+				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
+			)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+
+			By("validating that the metrics service is available")
+			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
+
+			By("getting the service account token")
+			token, err := serviceAccountToken()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(token).NotTo(BeEmpty())
+
+			By("ensuring the controller pod is ready")
+			verifyControllerPodReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("True"), "Controller pod not ready")
+			}
+			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying that the controller manager is serving the metrics server")
+			verifyMetricsServerStarted := func(g Gomega) {
+				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("Serving metrics server"),
+					"Metrics server not yet started")
+			}
+			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+
+			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
+
+			By("creating the curl-metrics pod to access the metrics endpoint")
+			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
+				"--namespace", namespace,
+				"--image=curlimages/curl:latest",
+				"--overrides",
+				fmt.Sprintf(`{
+					"spec": {
+						"containers": [{
+							"name": "curl",
+							"image": "curlimages/curl:latest",
+							"command": ["/bin/sh", "-c"],
+							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
+							"securityContext": {
+								"readOnlyRootFilesystem": true,
+								"allowPrivilegeEscalation": false,
+								"capabilities": {
+									"drop": ["ALL"]
+								},
+								"runAsNonRoot": true,
+								"runAsUser": 1000,
+								"seccompProfile": {
+									"type": "RuntimeDefault"
+								}
+							}
+						}],
+						"serviceAccountName": "%s"
+					}
+				}`, token, metricsServiceName, namespace, serviceAccountName))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
+
+			By("waiting for the curl-metrics pod to complete.")
+			verifyCurlUp := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
+					"-o", "jsonpath={.status.phase}",
+					"-n", namespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
+			}
+			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
+
+			By("getting the metrics by checking curl-metrics logs")
+			verifyMetricsAvailable := func(g Gomega) {
+				metricsOutput, err := getMetricsOutput()
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
+				g.Expect(metricsOutput).NotTo(BeEmpty())
+				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
+			}
+			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
+		})
+
+		// +kubebuilder:scaffold:e2e-webhooks-checks
+
+		// TODO: Customize the e2e test suite with scenarios specific to your project.
+		// Consider applying sample/CR(s) and check their status and/or verifying
+		// the reconciliation by using the metrics, i.e.:
+		// metricsOutput, err := getMetricsOutput()
+		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
+		// Expect(metricsOutput).To(ContainSubstring(
+		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
+		//    strings.ToLower(<Kind>),
+		// ))
+	})
+})
+
+// serviceAccountToken returns a token for the specified service account in the given namespace.
+// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
+// and parsing the resulting token from the API response.
+func serviceAccountToken() (string, error) {
+	const tokenRequestRawString = `{
+		"apiVersion": "authentication.k8s.io/v1",
+		"kind": "TokenRequest"
+	}`
+
+	// Temporary file to store the token request
+	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
+	tokenRequestFile := filepath.Join("/tmp", secretName)
+	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+	if err != nil {
+		return "", err
+	}
+
+	var out string
+	verifyTokenCreation := func(g Gomega) {
+		// Execute kubectl command to create the token
+		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
+			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
+			namespace,
+			serviceAccountName,
+		), "-f", tokenRequestFile)
+
+		output, err := cmd.CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred())
+
+		// Parse the JSON output to extract the token
+		var token tokenRequest
+		err = json.Unmarshal(output, &token)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		out = token.Status.Token
+	}
+	Eventually(verifyTokenCreation).Should(Succeed())
+
+	return out, err
+}
+
+// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
+func getMetricsOutput() (string, error) {
+	By("getting the curl-metrics logs")
+	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
+	return utils.Run(cmd)
+}
+
+// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
+// containing only the token field that we need to extract.
+type tokenRequest struct {
+	Status struct {
+		Token string `json:"token"`
+	} `json:"status"`
+}
+
+
+================================================================================
+FILE: ./test/e2e/e2e_suite_test.go
+================================================================================
+
+//go:build e2e
+// +build e2e
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package e2e
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"testing"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"kleff.io/test/utils"
+)
+
+var (
+	// Optional Environment Variables:
+	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
+	// These variables are useful if CertManager is already installed, avoiding
+	// re-installation and conflicts.
+	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
+	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
+	isCertManagerAlreadyInstalled = false
+
+	// projectImage is the name of the image which will be build and loaded
+	// with the code source changes to be tested.
+	projectImage = "example.com/operator:v0.0.1"
+)
+
+// TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
+// temporary environment to validate project changes with the purpose of being used in CI jobs.
+// The default setup requires Kind, builds/loads the Manager Docker image locally, and installs
+// CertManager.
+func TestE2E(t *testing.T) {
+	RegisterFailHandler(Fail)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Starting operator integration test suite\n")
+	RunSpecs(t, "e2e suite")
+}
+
+var _ = BeforeSuite(func() {
+	By("building the manager(Operator) image")
+	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
+	_, err := utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
+
+	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
+	// built and available before running the tests. Also, remove the following block.
+	By("loading the manager(Operator) image on Kind")
+	err = utils.LoadImageToKindClusterWithName(projectImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+
+	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
+	// To prevent errors when tests run in environments with CertManager already installed,
+	// we check for its presence before execution.
+	// Setup CertManager before the suite if not skipped and if not already installed
+	if !skipCertManagerInstall {
+		By("checking if cert manager is installed already")
+		isCertManagerAlreadyInstalled = utils.IsCertManagerCRDsInstalled()
+		if !isCertManagerAlreadyInstalled {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Installing CertManager...\n")
+			Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
+		}
+	}
+})
+
+var _ = AfterSuite(func() {
+	// Teardown CertManager after the suite if not skipped and if it was not already installed
+	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
+		utils.UninstallCertManager()
+	}
+})
+
+
+================================================================================
+FILE: ./dist/chart/Chart.yaml
+================================================================================
+
+apiVersion: v2
+name: operator
+description: A Helm chart to distribute the project operator
+type: application
+version: 0.1.8
+appVersion: "0.1.8"
+icon: "https://example.com/icon.png"
+
+
+================================================================================
+FILE: ./dist/chart/templates/metrics/controller-manager-metrics-service.yaml
+================================================================================
+
+{{- if .Values.metrics.enable }}
+apiVersion: v1
+kind: Service
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+        control-plane: controller-manager
+    name: operator-controller-manager-metrics-service
+    namespace: {{ .Release.Namespace }}
+spec:
+    ports:
+        - name: https
+          port: {{ .Values.metrics.port }}
+          protocol: TCP
+          targetPort: {{ .Values.metrics.port }}
+    selector:
+        app.kubernetes.io/name: operator
+        control-plane: controller-manager
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/leader-election-rolebinding.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-leader-election-rolebinding
+    namespace: {{ .Release.Namespace }}
+roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: Role
+    name: operator-leader-election-role
+subjects:
+    - kind: ServiceAccount
+      name: operator-controller-manager
+      namespace: {{ .Release.Namespace }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/metrics-auth-rolebinding.yaml
+================================================================================
+
+{{- if .Values.metrics.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+    name: operator-metrics-auth-rolebinding
+roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: operator-metrics-auth-role
+subjects:
+    - kind: ServiceAccount
+      name: operator-controller-manager
+      namespace: {{ .Release.Namespace }}
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/controller-manager.yaml
+================================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-controller-manager
+    namespace: {{ .Release.Namespace }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/manager-role.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    name: operator-manager-role
+rules:
+    - apiGroups:
+        - ""
+      resources:
+        - services
+      verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+        - apps
+      resources:
+        - deployments
+      verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+        - gateway.networking.k8s.io
+      resources:
+        - httproutes
+      verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps
+      verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps/status
+      verbs:
+        - get
+        - patch
+        - update
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/manager-rolebinding.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-manager-rolebinding
+roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: operator-manager-role
+subjects:
+    - kind: ServiceAccount
+      name: operator-controller-manager
+      namespace: {{ .Release.Namespace }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/metrics-auth-role.yaml
+================================================================================
+
+{{- if .Values.metrics.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    name: operator-metrics-auth-role
+rules:
+    - apiGroups:
+        - authentication.k8s.io
+      resources:
+        - tokenreviews
+      verbs:
+        - create
+    - apiGroups:
+        - authorization.k8s.io
+      resources:
+        - subjectaccessreviews
+      verbs:
+        - create
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/webapp-admin-role.yaml
+================================================================================
+
+{{- if .Values.rbacHelpers.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-webapp-admin-role
+rules:
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps
+      verbs:
+        - '*'
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps/status
+      verbs:
+        - get
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/webapp-viewer-role.yaml
+================================================================================
+
+{{- if .Values.rbacHelpers.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-webapp-viewer-role
+rules:
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps
+      verbs:
+        - get
+        - list
+        - watch
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps/status
+      verbs:
+        - get
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/metrics-reader.yaml
+================================================================================
+
+{{- if .Values.metrics.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    name: operator-metrics-reader
+rules:
+    - nonResourceURLs:
+        - /metrics
+      verbs:
+        - get
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/leader-election-role.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-leader-election-role
+    namespace: {{ .Release.Namespace }}
+rules:
+    - apiGroups:
+        - ""
+      resources:
+        - configmaps
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+        - delete
+    - apiGroups:
+        - coordination.k8s.io
+      resources:
+        - leases
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+        - delete
+    - apiGroups:
+        - ""
+      resources:
+        - events
+      verbs:
+        - create
+        - patch
+
+
+================================================================================
+FILE: ./dist/chart/templates/rbac/webapp-editor-role.yaml
+================================================================================
+
+{{- if .Values.rbacHelpers.enable }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+    name: operator-webapp-editor-role
+rules:
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps
+      verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+    - apiGroups:
+        - kleff.kleff.io
+      resources:
+        - webapps/status
+      verbs:
+        - get
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/crd/webapps.kleff.kleff.io.yaml
+================================================================================
+
+{{- if .Values.crd.enable }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+    annotations:
+        controller-gen.kubebuilder.io/version: v0.19.0
+    name: webapps.kleff.kleff.io
+spec:
+    group: kleff.kleff.io
+    names:
+        kind: WebApp
+        listKind: WebAppList
+        plural: webapps
+        singular: webapp
+    scope: Namespaced
+    versions:
+        - name: v1
+          schema:
+            openAPIV3Schema:
+                description: WebApp is the Schema for the webapps API
+                properties:
+                    apiVersion:
+                        description: |-
+                            APIVersion defines the versioned schema of this representation of an object.
+                            Servers should convert recognized schemas to the latest internal value, and
+                            may reject unrecognized values.
+                            More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+                        type: string
+                    kind:
+                        description: |-
+                            Kind is a string value representing the REST resource this object represents.
+                            Servers may infer this from the endpoint the client submits requests to.
+                            Cannot be updated.
+                            In CamelCase.
+                            More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                        type: string
+                    metadata:
+                        type: object
+                    spec:
+                        description: spec defines the desired state of WebApp
+                        properties:
+                            branch:
+                                type: string
+                            displayName:
+                                description: foo is an example field of WebApp. Edit webapp_types.go to remove/update
+                                minLength: 1
+                                type: string
+                            envVariables:
+                                additionalProperties:
+                                    type: string
+                                type: object
+                            image:
+                                type: string
+                            port:
+                                default: 8080
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                            repoURL:
+                                type: string
+                        required:
+                            - image
+                        type: object
+                    status:
+                        description: status defines the observed state of WebApp
+                        properties:
+                            conditions:
+                                description: |-
+                                    conditions represent the current state of the WebApp resource.
+                                    Each condition has a unique type and reflects the status of a specific aspect of the resource.
+
+                                    Standard condition types include:
+                                    - "Available": the resource is fully functional
+                                    - "Progressing": the resource is being created or updated
+                                    - "Degraded": the resource failed to reach or maintain its desired state
+
+                                    The status of each condition is one of True, False, or Unknown.
+                                items:
+                                    description: Condition contains details for one aspect of the current state of this API Resource.
+                                    properties:
+                                        lastTransitionTime:
+                                            description: |-
+                                                lastTransitionTime is the last time the condition transitioned from one status to another.
+                                                This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                                            format: date-time
+                                            type: string
+                                        message:
+                                            description: |-
+                                                message is a human readable message indicating details about the transition.
+                                                This may be an empty string.
+                                            maxLength: 32768
+                                            type: string
+                                        observedGeneration:
+                                            description: |-
+                                                observedGeneration represents the .metadata.generation that the condition was set based upon.
+                                                For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                                                with respect to the current state of the instance.
+                                            format: int64
+                                            minimum: 0
+                                            type: integer
+                                        reason:
+                                            description: |-
+                                                reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                                                Producers of specific condition types may define expected values and meanings for this field,
+                                                and whether the values are considered a guaranteed API.
+                                                The value should be a CamelCase string.
+                                                This field may not be empty.
+                                            maxLength: 1024
+                                            minLength: 1
+                                            pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                                            type: string
+                                        status:
+                                            description: status of the condition, one of True, False, Unknown.
+                                            enum:
+                                                - "True"
+                                                - "False"
+                                                - Unknown
+                                            type: string
+                                        type:
+                                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                                            maxLength: 316
+                                            pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                                            type: string
+                                    required:
+                                        - lastTransitionTime
+                                        - message
+                                        - reason
+                                        - status
+                                        - type
+                                    type: object
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                    - type
+                                x-kubernetes-list-type: map
+                        type: object
+                required:
+                    - spec
+                type: object
+          served: true
+          storage: true
+          subresources:
+            status: {}
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/templates/manager/manager.yaml
+================================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    labels:
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/name: operator
+        control-plane: controller-manager
+    name: operator-controller-manager
+    namespace: {{ .Release.Namespace }}
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            app.kubernetes.io/name: operator
+            control-plane: controller-manager
+    template:
+        metadata:
+            annotations:
+                kubectl.kubernetes.io/default-container: manager
+            labels:
+                app.kubernetes.io/name: operator
+                control-plane: controller-manager
+        spec:
+            {{- if .Values.manager.imagePullSecrets }}
+            imagePullSecrets:
+              {{- toYaml .Values.manager.imagePullSecrets | nindent 14 }}
+            {{- end }}
+            containers:
+                - args:
+                    {{- if .Values.metrics.enable }}
+                    - --metrics-bind-address=:{{ .Values.metrics.port }}
+                    {{- else }}
+                    # Bind to :0 to disable the controller-runtime managed metrics server
+                    - --metrics-bind-address=0
+                    {{- end }}
+                    - --health-probe-bind-address=:8081
+                    {{- range .Values.manager.args }}
+                    - {{ . }}
+                    {{- end }}
+                  command:
+                    - /manager
+                  image: "{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag }}"
+                  imagePullPolicy: {{ .Values.manager.image.pullPolicy }}
+                  livenessProbe:
+                    httpGet:
+                        path: /healthz
+                        port: 8081
+                    initialDelaySeconds: 15
+                    periodSeconds: 20
+                  name: manager
+                  ports: []
+                  readinessProbe:
+                    httpGet:
+                        path: /readyz
+                        port: 8081
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+                  resources:
+                    {{- if .Values.manager.resources }}
+                    {{- toYaml .Values.manager.resources | nindent 20 }}
+                    {{- else }}
+                    {}
+                    {{- end }}
+                  securityContext:
+                    {{- if .Values.manager.securityContext }}
+                    {{- toYaml .Values.manager.securityContext | nindent 20 }}
+                    {{- else }}
+                    {}
+                    {{- end }}
+                  volumeMounts: []
+            securityContext:
+              {{- if .Values.manager.podSecurityContext }}
+              {{- toYaml .Values.manager.podSecurityContext | nindent 14 }}
+              {{- else }}
+              {}
+              {{- end }}
+            serviceAccountName: operator-controller-manager
+            terminationGracePeriodSeconds: 10
+            volumes: []
+
+
+================================================================================
+FILE: ./dist/chart/templates/monitoring/servicemonitor.yaml
+================================================================================
+
+{{- if .Values.prometheus.enable }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+    control-plane: controller-manager
+  name: operator-controller-manager-metrics-monitor
+  namespace: {{ .Release.Namespace }}
+spec:
+  endpoints:
+    - path: /metrics
+      port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        {{- if .Values.certManager.enable }}
+        serverName: operator-controller-manager-metrics-service.{{ .Release.Namespace }}.svc
+        # Apply secure TLS configuration with cert-manager
+        insecureSkipVerify: false
+        ca:
+          secret:
+            name: metrics-server-cert
+            key: ca.crt
+        cert:
+          secret:
+            name: metrics-server-cert
+            key: tls.crt
+        keySecret:
+          name: metrics-server-cert
+          key: tls.key
+        {{- else }}
+        # Development/Test mode (insecure configuration)
+        insecureSkipVerify: true
+        {{- end }}
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+{{- end }}
+
+
+================================================================================
+FILE: ./dist/chart/values.yaml
+================================================================================
+
+# Configure the controller manager deployment
+manager:
+  imagePullSecrets:
+    - name: acr-creds
+  replicas: 1
+  
+  image:
+    repository: kleff.azurecr.io/controller
+    tag: 0.1.0
+    pullPolicy: Always
+
+  # Arguments
+  args:
+    - --leader-elect
+
+  # Environment variables
+  env: []
+
+  # Pod-level security settings
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+        type: RuntimeDefault
+
+  # Container-level security settings
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+        drop:
+            - ALL
+    readOnlyRootFilesystem: true
+
+  # Resource limits and requests
+  resources:
+    limits:
+        cpu: 500m
+        memory: 128Mi
+    requests:
+        cpu: 10m
+        memory: 64Mi
+
+# Essential RBAC permissions (required for controller operation)
+# These include ServiceAccount, controller permissions, leader election, and metrics access
+# Note: Essential RBAC is always enabled as it's required for the controller to function
+
+# Helper RBAC roles for managing custom resources
+# These provide convenient admin/editor/viewer roles for each CRD type
+# Useful for giving users different levels of access to your custom resources
+rbacHelpers:
+  enable: false  # Install convenience admin/editor/viewer roles for CRDs
+
+# Custom Resource Definitions
+crd:
+  enable: true  # Install CRDs with the chart
+  keep: true    # Keep CRDs when uninstalling
+
+# Controller metrics endpoint.
+# Enable to expose /metrics endpoint with RBAC protection.
+metrics:
+  enable: true
+  port: 8443  # Metrics server port
+
+# Cert-manager integration for TLS certificates.
+# Required for webhook certificates and metrics endpoint certificates.
+certManager:
+  enable: false
+
+# Prometheus ServiceMonitor for metrics scraping.
+# Requires prometheus-operator to be installed in the cluster.
+prometheus:
+  enable: false
+
+
+
+================================================================================
+FILE: ./dist/install.yaml
+================================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+    control-plane: controller-manager
+  name: operator-system
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: webapps.kleff.kleff.io
+spec:
+  group: kleff.kleff.io
+  names:
+    kind: WebApp
+    listKind: WebAppList
+    plural: webapps
+    singular: webapp
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: WebApp is the Schema for the webapps API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WebAppSpec defines the desired state of WebApp
+            properties:
+              branch:
+                type: string
+              containerID:
+                description: 'ADDED: The UUID from the build request'
+                type: string
+              displayName:
+                minLength: 1
+                type: string
+              envVariables:
+                additionalProperties:
+                  type: string
+                type: object
+              image:
+                type: string
+              port:
+                default: 8080
+                maximum: 65535
+                minimum: 1
+                type: integer
+              repoURL:
+                type: string
+            required:
+            - image
+            type: object
+          status:
+            description: WebAppStatus defines the observed state of WebApp.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-controller-manager
+  namespace: operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-leader-election-role
+  namespace: operator-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-metrics-auth-role
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-metrics-reader
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-webapp-admin-role
+rules:
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - '*'
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-webapp-editor-role
+rules:
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-webapp-viewer-role
+rules:
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-leader-election-rolebinding
+  namespace: operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: operator-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: operator-controller-manager
+  namespace: operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+  name: operator-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: operator-manager-role
+subjects:
+- kind: ServiceAccount
+  name: operator-controller-manager
+  namespace: operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-metrics-auth-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: operator-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: operator-controller-manager
+  namespace: operator-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+    control-plane: controller-manager
+  name: operator-controller-manager-metrics-service
+  namespace: operator-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    app.kubernetes.io/name: operator
+    control-plane: controller-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: operator
+    control-plane: controller-manager
+  name: operator-controller-manager
+  namespace: operator-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: operator
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/name: operator
+        control-plane: controller-manager
+    spec:
+      containers:
+      - args:
+        - --metrics-bind-address=:8443
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        command:
+        - /manager
+        image: kleff.azurecr.io/webapp-operator:latest
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: manager
+        ports: []
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts: []
+      imagePullSecrets:
+      - name: acr-creds
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: operator-controller-manager
+      terminationGracePeriodSeconds: 10
+      volumes: []
+
+
+================================================================================
+FILE: ./config/rbac/webapp_viewer_role.yaml
+================================================================================
+
+# This rule is not used by the project operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to kleff.kleff.io resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: webapp-viewer-role
+rules:
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+
+
+================================================================================
+FILE: ./config/rbac/leader_election_role_binding.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: leader-election-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system
+
+
+================================================================================
+FILE: ./config/rbac/metrics_auth_role_binding.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metrics-auth-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system
+
+
+================================================================================
+FILE: ./config/rbac/role.yaml
+================================================================================
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+  - patch
+  - update
+
+
+================================================================================
+FILE: ./config/rbac/leader_election_role.yaml
+================================================================================
+
+# permissions to do leader election.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: leader-election-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+
+
+================================================================================
+FILE: ./config/rbac/kustomization.yaml
+================================================================================
+
+resources:
+# All RBAC will be applied under this service account in
+# the deployment namespace. You may comment out this resource
+# if your manager will use a service account that exists at
+# runtime. Be sure to update RoleBinding and ClusterRoleBinding
+# subjects if changing service account names.
+- service_account.yaml
+- role.yaml
+- role_binding.yaml
+- leader_election_role.yaml
+- leader_election_role_binding.yaml
+# The following RBAC configurations are used to protect
+# the metrics endpoint with authn/authz. These configurations
+# ensure that only authorized users and service accounts
+# can access the metrics endpoint. Comment the following
+# permissions if you want to disable this protection.
+# More info: https://book.kubebuilder.io/reference/metrics.html
+- metrics_auth_role.yaml
+- metrics_auth_role_binding.yaml
+- metrics_reader_role.yaml
+# For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
+# default, aiding admins in cluster management. Those roles are
+# not used by the operator itself. You can comment the following lines
+# if you do not want those helpers be installed with your Project.
+- webapp_admin_role.yaml
+- webapp_editor_role.yaml
+- webapp_viewer_role.yaml
+
+
+
+================================================================================
+FILE: ./config/rbac/role_binding.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: manager-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system
+
+
+================================================================================
+FILE: ./config/rbac/metrics_reader_role.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metrics-reader
+rules:
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+
+
+================================================================================
+FILE: ./config/rbac/service_account.yaml
+================================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager
+  namespace: system
+
+
+================================================================================
+FILE: ./config/rbac/webapp_editor_role.yaml
+================================================================================
+
+# This rule is not used by the project operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants permissions to create, update, and delete resources within the kleff.kleff.io.
+# This role is intended for users who need to manage these resources
+# but should not control RBAC or manage permissions for others.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: webapp-editor-role
+rules:
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+
+
+================================================================================
+FILE: ./config/rbac/metrics_auth_role.yaml
+================================================================================
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metrics-auth-role
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+
+
+================================================================================
+FILE: ./config/rbac/webapp_admin_role.yaml
+================================================================================
+
+# This rule is not used by the project operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants full permissions ('*') over kleff.kleff.io.
+# This role is intended for users authorized to modify roles and bindings within the cluster,
+# enabling them to delegate specific permissions to other users or groups as needed.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: webapp-admin-role
+rules:
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps
+  verbs:
+  - '*'
+- apiGroups:
+  - kleff.kleff.io
+  resources:
+  - webapps/status
+  verbs:
+  - get
+
+
+================================================================================
+FILE: ./config/network-policy/kustomization.yaml
+================================================================================
+
+resources:
+- allow-metrics-traffic.yaml
+
+
+================================================================================
+FILE: ./config/network-policy/allow-metrics-traffic.yaml
+================================================================================
+
+# This NetworkPolicy allows ingress traffic
+# with Pods running on namespaces labeled with 'metrics: enabled'. Only Pods on those
+# namespaces are able to gather data from the metrics endpoint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: allow-metrics-traffic
+  namespace: system
+spec:
+  podSelector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: operator
+  policyTypes:
+    - Ingress
+  ingress:
+    # This allows ingress traffic from any namespace with the label metrics: enabled
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            metrics: enabled  # Only from namespaces with this label
+      ports:
+        - port: 8443
+          protocol: TCP
+
+
+================================================================================
+FILE: ./config/crd/kustomizeconfig.yaml
+================================================================================
+
+# This file is for teaching kustomize how to substitute name and namespace reference in CRD
+nameReference:
+- kind: Service
+  version: v1
+  fieldSpecs:
+  - kind: CustomResourceDefinition
+    version: v1
+    group: apiextensions.k8s.io
+    path: spec/conversion/webhook/clientConfig/service/name
+
+namespace:
+- kind: CustomResourceDefinition
+  version: v1
+  group: apiextensions.k8s.io
+  path: spec/conversion/webhook/clientConfig/service/namespace
+  create: false
+
+varReference:
+- path: metadata/annotations
+
+
+================================================================================
+FILE: ./config/crd/kustomization.yaml
+================================================================================
+
+# This kustomization.yaml is not intended to be run by itself,
+# since it depends on service name and namespace that are out of this kustomize package.
+# It should be run by config/default
+resources:
+- bases/kleff.kleff.io_webapps.yaml
+# +kubebuilder:scaffold:crdkustomizeresource
+
+patches:
+# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix.
+# patches here are for enabling the conversion webhook for each CRD
+# +kubebuilder:scaffold:crdkustomizewebhookpatch
+
+# [WEBHOOK] To enable webhook, uncomment the following section
+# the following config is for teaching kustomize how to do kustomization for CRDs.
+#configurations:
+#- kustomizeconfig.yaml
+
+
+================================================================================
+FILE: ./config/crd/bases/kleff.kleff.io_webapps.yaml
+================================================================================
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: webapps.kleff.kleff.io
+spec:
+  group: kleff.kleff.io
+  names:
+    kind: WebApp
+    listKind: WebAppList
+    plural: webapps
+    singular: webapp
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: WebApp is the Schema for the webapps API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WebAppSpec defines the desired state of WebApp
+            properties:
+              branch:
+                type: string
+              containerID:
+                description: 'ADDED: The UUID from the build request'
+                type: string
+              displayName:
+                minLength: 1
+                type: string
+              envVariables:
+                additionalProperties:
+                  type: string
+                type: object
+              image:
+                type: string
+              port:
+                default: 8080
+                maximum: 65535
+                minimum: 1
+                type: integer
+              repoURL:
+                type: string
+            required:
+            - image
+            type: object
+          status:
+            description: WebAppStatus defines the observed state of WebApp.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+
+================================================================================
+FILE: ./config/default/kustomization.yaml
+================================================================================
+
+# Adds namespace to all resources.
+namespace: operator-system
+
+# Value of this field is prepended to the
+# names of all resources, e.g. a deployment named
+# "wordpress" becomes "alices-wordpress".
+# Note that it should also match with the prefix (text before '-') of the namespace
+# field above.
+namePrefix: operator-
+
+# Labels to add to all resources and selectors.
+#labels:
+#- includeSelectors: true
+#  pairs:
+#    someName: someValue
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
+# crd/kustomization.yaml
+#- ../webhook
+# [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'. 'WEBHOOK' components are required.
+#- ../certmanager
+# [PROMETHEUS] To enable prometheus monitor, uncomment all sections with 'PROMETHEUS'.
+#- ../prometheus
+# [METRICS] Expose the controller manager metrics service.
+- metrics_service.yaml
+# [NETWORK POLICY] Protect the /metrics endpoint and Webhook Server with NetworkPolicy.
+# Only Pod(s) running a namespace labeled with 'metrics: enabled' will be able to gather the metrics.
+# Only CR(s) which requires webhooks and are applied on namespaces labeled with 'webhooks: enabled' will
+# be able to communicate with the Webhook Server.
+#- ../network-policy
+
+# Uncomment the patches line if you enable Metrics
+patches:
+# [METRICS] The following patch will enable the metrics endpoint using HTTPS and the port :8443.
+# More info: https://book.kubebuilder.io/reference/metrics
+- path: manager_metrics_patch.yaml
+  target:
+    kind: Deployment
+
+# Uncomment the patches line if you enable Metrics and CertManager
+# [METRICS-WITH-CERTS] To enable metrics protected with certManager, uncomment the following line.
+# This patch will protect the metrics with certManager self-signed certs.
+#- path: cert_metrics_manager_patch.yaml
+#  target:
+#    kind: Deployment
+
+# [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
+# crd/kustomization.yaml
+#- path: manager_webhook_patch.yaml
+#  target:
+#    kind: Deployment
+
+# [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
+# Uncomment the following replacements to add the cert-manager CA injection annotations
+#replacements:
+# - source: # Uncomment the following block to enable certificates for metrics
+#     kind: Service
+#     version: v1
+#     name: controller-manager-metrics-service
+#     fieldPath: metadata.name
+#   targets:
+#     - select:
+#         kind: Certificate
+#         group: cert-manager.io
+#         version: v1
+#         name: metrics-certs
+#       fieldPaths:
+#         - spec.dnsNames.0
+#         - spec.dnsNames.1
+#       options:
+#         delimiter: '.'
+#         index: 0
+#         create: true
+#     - select: # Uncomment the following to set the Service name for TLS config in Prometheus ServiceMonitor
+#         kind: ServiceMonitor
+#         group: monitoring.coreos.com
+#         version: v1
+#         name: controller-manager-metrics-monitor
+#       fieldPaths:
+#         - spec.endpoints.0.tlsConfig.serverName
+#       options:
+#         delimiter: '.'
+#         index: 0
+#         create: true
+
+# - source:
+#     kind: Service
+#     version: v1
+#     name: controller-manager-metrics-service
+#     fieldPath: metadata.namespace
+#   targets:
+#     - select:
+#         kind: Certificate
+#         group: cert-manager.io
+#         version: v1
+#         name: metrics-certs
+#       fieldPaths:
+#         - spec.dnsNames.0
+#         - spec.dnsNames.1
+#       options:
+#         delimiter: '.'
+#         index: 1
+#         create: true
+#     - select: # Uncomment the following to set the Service namespace for TLS in Prometheus ServiceMonitor
+#         kind: ServiceMonitor
+#         group: monitoring.coreos.com
+#         version: v1
+#         name: controller-manager-metrics-monitor
+#       fieldPaths:
+#         - spec.endpoints.0.tlsConfig.serverName
+#       options:
+#         delimiter: '.'
+#         index: 1
+#         create: true
+
+# - source: # Uncomment the following block if you have any webhook
+#     kind: Service
+#     version: v1
+#     name: webhook-service
+#     fieldPath: .metadata.name # Name of the service
+#   targets:
+#     - select:
+#         kind: Certificate
+#         group: cert-manager.io
+#         version: v1
+#         name: serving-cert
+#       fieldPaths:
+#         - .spec.dnsNames.0
+#         - .spec.dnsNames.1
+#       options:
+#         delimiter: '.'
+#         index: 0
+#         create: true
+# - source:
+#     kind: Service
+#     version: v1
+#     name: webhook-service
+#     fieldPath: .metadata.namespace # Namespace of the service
+#   targets:
+#     - select:
+#         kind: Certificate
+#         group: cert-manager.io
+#         version: v1
+#         name: serving-cert
+#       fieldPaths:
+#         - .spec.dnsNames.0
+#         - .spec.dnsNames.1
+#       options:
+#         delimiter: '.'
+#         index: 1
+#         create: true
+
+# - source: # Uncomment the following block if you have a ValidatingWebhook (--programmatic-validation)
+#     kind: Certificate
+#     group: cert-manager.io
+#     version: v1
+#     name: serving-cert # This name should match the one in certificate.yaml
+#     fieldPath: .metadata.namespace # Namespace of the certificate CR
+#   targets:
+#     - select:
+#         kind: ValidatingWebhookConfiguration
+#       fieldPaths:
+#         - .metadata.annotations.[cert-manager.io/inject-ca-from]
+#       options:
+#         delimiter: '/'
+#         index: 0
+#         create: true
+# - source:
+#     kind: Certificate
+#     group: cert-manager.io
+#     version: v1
+#     name: serving-cert
+#     fieldPath: .metadata.name
+#   targets:
+#     - select:
+#         kind: ValidatingWebhookConfiguration
+#       fieldPaths:
+#         - .metadata.annotations.[cert-manager.io/inject-ca-from]
+#       options:
+#         delimiter: '/'
+#         index: 1
+#         create: true
+
+# - source: # Uncomment the following block if you have a DefaultingWebhook (--defaulting )
+#     kind: Certificate
+#     group: cert-manager.io
+#     version: v1
+#     name: serving-cert
+#     fieldPath: .metadata.namespace # Namespace of the certificate CR
+#   targets:
+#     - select:
+#         kind: MutatingWebhookConfiguration
+#       fieldPaths:
+#         - .metadata.annotations.[cert-manager.io/inject-ca-from]
+#       options:
+#         delimiter: '/'
+#         index: 0
+#         create: true
+# - source:
+#     kind: Certificate
+#     group: cert-manager.io
+#     version: v1
+#     name: serving-cert
+#     fieldPath: .metadata.name
+#   targets:
+#     - select:
+#         kind: MutatingWebhookConfiguration
+#       fieldPaths:
+#         - .metadata.annotations.[cert-manager.io/inject-ca-from]
+#       options:
+#         delimiter: '/'
+#         index: 1
+#         create: true
+
+# - source: # Uncomment the following block if you have a ConversionWebhook (--conversion)
+#     kind: Certificate
+#     group: cert-manager.io
+#     version: v1
+#     name: serving-cert
+#     fieldPath: .metadata.namespace # Namespace of the certificate CR
+#   targets: # Do not remove or uncomment the following scaffold marker; required to generate code for target CRD.
+# +kubebuilder:scaffold:crdkustomizecainjectionns
+# - source:
+#     kind: Certificate
+#     group: cert-manager.io
+#     version: v1
+#     name: serving-cert
+#     fieldPath: .metadata.name
+#   targets: # Do not remove or uncomment the following scaffold marker; required to generate code for target CRD.
+# +kubebuilder:scaffold:crdkustomizecainjectionname
+
+
+================================================================================
+FILE: ./config/default/manager_metrics_patch.yaml
+================================================================================
+
+# This patch adds the args to allow exposing the metrics endpoint using HTTPS
+- op: add
+  path: /spec/template/spec/containers/0/args/0
+  value: --metrics-bind-address=:8443
+
+
+================================================================================
+FILE: ./config/default/cert_metrics_manager_patch.yaml
+================================================================================
+
+# This patch adds the args, volumes, and ports to allow the manager to use the metrics-server certs.
+
+# Add the volumeMount for the metrics-server certs
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    mountPath: /tmp/k8s-metrics-server/metrics-certs
+    name: metrics-certs
+    readOnly: true
+
+# Add the --metrics-cert-path argument for the metrics server
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --metrics-cert-path=/tmp/k8s-metrics-server/metrics-certs
+
+# Add the metrics-server certs volume configuration
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: metrics-certs
+    secret:
+      secretName: metrics-server-cert
+      optional: false
+      items:
+        - key: ca.crt
+          path: ca.crt
+        - key: tls.crt
+          path: tls.crt
+        - key: tls.key
+          path: tls.key
+
+
+================================================================================
+FILE: ./config/default/metrics_service.yaml
+================================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-metrics-service
+  namespace: system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    control-plane: controller-manager
+    app.kubernetes.io/name: operator
+
+
+================================================================================
+FILE: ./config/samples/kustomization.yaml
+================================================================================
+
+## Append samples of your project ##
+resources:
+- kleff_v1_webapp.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
+
+
+================================================================================
+FILE: ./config/samples/kleff_v1_webapp.yaml
+================================================================================
+
+apiVersion: kleff.kleff.io/v1
+kind: WebApp
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: webapp-sample
+spec:
+  displayName: "My Production App"
+  repoURL: "https://github.com/my-org/my-repo.git"
+  branch: "main"
+  image: "nginx:1.25.3"
+  port: 8080
+
+================================================================================
+FILE: ./config/manager/kustomization.yaml
+================================================================================
+
+resources:
+- manager.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+images:
+- name: controller
+  newName: kleff.azurecr.io/webapp-operator
+  newTag: latest
+
+
+================================================================================
+FILE: ./config/manager/manager.yaml
+================================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: operator
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: operator
+    spec:
+      # TODO(user): Uncomment the following code to configure the nodeAffinity expression
+      # according to the platforms which are supported by your solution.
+      # It is considered best practice to support multiple architectures. You can
+      # build your manager image using the makefile target docker-buildx.
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #         - matchExpressions:
+      #           - key: kubernetes.io/arch
+      #             operator: In
+      #             values:
+      #               - amd64
+      #               - arm64
+      #               - ppc64le
+      #               - s390x
+      #           - key: kubernetes.io/os
+      #             operator: In
+      #             values:
+      #               - linux
+      securityContext:
+        # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
+        # This ensures that deployments meet the highest security requirements for Kubernetes.
+        # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+      - name: acr-creds
+      containers:
+      - command:
+        - /manager
+        args:
+          - --leader-elect
+          - --health-probe-bind-address=:8081
+        image: controller:latest
+        name: manager
+        ports: []
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # TODO(user): Configure the resources accordingly based on the project requirements.
+        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        volumeMounts: []
+      volumes: []
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10
+
+
+================================================================================
+FILE: ./config/prometheus/monitor.yaml
+================================================================================
+
+# Prometheus Monitor Service (Metrics)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-metrics-monitor
+  namespace: system
+spec:
+  endpoints:
+    - path: /metrics
+      port: https # Ensure this is the name of the port that exposes HTTPS metrics
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        # TODO(user): The option insecureSkipVerify: true is not recommended for production since it disables
+        # certificate verification, exposing the system to potential man-in-the-middle attacks.
+        # For production environments, it is recommended to use cert-manager for automatic TLS certificate management.
+        # To apply this configuration, enable cert-manager and use the patch located at config/prometheus/servicemonitor_tls_patch.yaml,
+        # which securely references the certificate from the 'metrics-server-cert' secret.
+        insecureSkipVerify: true
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: operator
+
+
+================================================================================
+FILE: ./config/prometheus/kustomization.yaml
+================================================================================
+
+resources:
+- monitor.yaml
+
+# [PROMETHEUS-WITH-CERTS] The following patch configures the ServiceMonitor in ../prometheus
+# to securely reference certificates created and managed by cert-manager.
+# Additionally, ensure that you uncomment the [METRICS WITH CERTMANAGER] patch under config/default/kustomization.yaml
+# to mount the "metrics-server-cert" secret in the Manager Deployment.
+#patches:
+#  - path: monitor_tls_patch.yaml
+#    target:
+#      kind: ServiceMonitor
+
+
+================================================================================
+FILE: ./config/prometheus/monitor_tls_patch.yaml
+================================================================================
+
+# Patch for Prometheus ServiceMonitor to enable secure TLS configuration
+# using certificates managed by cert-manager
+- op: replace
+  path: /spec/endpoints/0/tlsConfig
+  value:
+    # SERVICE_NAME and SERVICE_NAMESPACE will be substituted by kustomize
+    serverName: SERVICE_NAME.SERVICE_NAMESPACE.svc
+    insecureSkipVerify: false
+    ca:
+      secret:
+        name: metrics-server-cert
+        key: ca.crt
+    cert:
+      secret:
+        name: metrics-server-cert
+        key: tls.crt
+    keySecret:
+      name: metrics-server-cert
+      key: tls.key
+
+
+================================================================================
+FILE: ./Dockerfile
+================================================================================
+
+# Build the manager binary
+FROM golang:1.24 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+# Copy the Go Modules manifests
+COPY go.mod go.mod
+COPY go.sum go.sum
+# cache deps before building and copying source so that we don't need to re-download as much
+# and so that source changes don't invalidate our downloaded layer
+RUN go mod download
+
+# Copy the Go source (relies on .dockerignore to filter)
+COPY . .
+
+# Build
+# the GOARCH has no default value to allow the binary to be built according to the host where the command
+# was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
+# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
+# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+
+# Use distroless as minimal base image to package the manager binary
+# Refer to https://github.com/GoogleContainerTools/distroless for more details
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /workspace/manager .
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]
+
+
+================================================================================
+FILE: ./Makefile
+================================================================================
+
+# Image URL to use all building/pushing image targets
+IMG ?= controller:latest
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
+endif
+
+# CONTAINER_TOOL defines the container tool to be used for building images.
+# Be aware that the target commands are only tested with Docker which is
+# scaffolded by default. However, you might want to replace it to use other
+# tools. (i.e. podman)
+CONTAINER_TOOL ?= docker
+
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
+
+.PHONY: all
+all: build
+
+##@ General
+
+# The help target prints out all targets with their descriptions organized
+# beneath their categories. The categories are represented by '##@' and the
+# target descriptions by '##'. The awk command is responsible for reading the
+# entire set of makefiles included in this invocation, looking for lines of the
+# file as xyz: ## something, and then pretty-format the target and help. Then,
+# if there's a line with ##@ something, that gets pretty-printed as a category.
+# More info on the usage of ANSI control characters for terminal formatting:
+# https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
+# More info on the awk command:
+# http://linuxcommand.org/lc3_adv_awk.php
+
+.PHONY: help
+help: ## Display this help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+##@ Development
+
+.PHONY: manifests
+manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+
+.PHONY: generate
+generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+.PHONY: fmt
+fmt: ## Run go fmt against code.
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
+
+.PHONY: test
+test: manifests generate fmt vet setup-envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+
+# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
+# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
+# CertManager is installed by default; skip with:
+# - CERT_MANAGER_INSTALL_SKIP=true
+KIND_CLUSTER ?= operator-test-e2e
+
+.PHONY: setup-test-e2e
+setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+	@command -v $(KIND) >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	}
+	@case "$$($(KIND) get clusters)" in \
+		*"$(KIND_CLUSTER)"*) \
+			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+		*) \
+			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+	esac
+
+.PHONY: test-e2e
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	$(MAKE) cleanup-test-e2e
+
+.PHONY: cleanup-test-e2e
+cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
+	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+
+.PHONY: lint
+lint: golangci-lint ## Run golangci-lint linter
+	"$(GOLANGCI_LINT)" run
+
+.PHONY: lint-fix
+lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
+	"$(GOLANGCI_LINT)" run --fix
+
+.PHONY: lint-config
+lint-config: golangci-lint ## Verify golangci-lint linter configuration
+	"$(GOLANGCI_LINT)" config verify
+
+##@ Build
+
+.PHONY: build
+build: manifests generate fmt vet ## Build manager binary.
+	go build -o bin/manager cmd/main.go
+
+.PHONY: run
+run: manifests generate fmt vet ## Run a controller from your host.
+	go run ./cmd/main.go
+
+# If you wish to build the manager image targeting other platforms you can use the --platform flag.
+# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
+# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+.PHONY: docker-build
+docker-build: ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build -t ${IMG} .
+
+.PHONY: docker-push
+docker-push: ## Push docker image with the manager.
+	$(CONTAINER_TOOL) push ${IMG}
+
+# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
+# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
+# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
+# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
+# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
+PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+.PHONY: docker-buildx
+docker-buildx: ## Build and push docker image for the manager for cross-platform support
+	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	- $(CONTAINER_TOOL) buildx create --name operator-builder
+	$(CONTAINER_TOOL) buildx use operator-builder
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx rm operator-builder
+	rm Dockerfile.cross
+
+.PHONY: build-installer
+build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+	mkdir -p dist
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
+	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+
+##@ Deployment
+
+ifndef ignore-not-found
+  ignore-not-found = false
+endif
+
+.PHONY: install
+install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" apply -f -; else echo "No CRDs to install; skipping."; fi
+
+.PHONY: uninstall
+uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
+
+.PHONY: deploy
+deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
+	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+
+.PHONY: undeploy
+undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+
+##@ Dependencies
+
+## Location to install dependencies to
+LOCALBIN ?= $(shell pwd)/bin
+$(LOCALBIN):
+	mkdir -p "$(LOCALBIN)"
+
+## Tool Binaries
+KUBECTL ?= kubectl
+KIND ?= kind
+KUSTOMIZE ?= $(LOCALBIN)/kustomize
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+ENVTEST ?= $(LOCALBIN)/setup-envtest
+GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+
+## Tool Versions
+KUSTOMIZE_VERSION ?= v5.7.1
+CONTROLLER_TOOLS_VERSION ?= v0.19.0
+
+#ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
+ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
+  [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
+  printf '%s\n' "$$v" | sed -E 's/^v?([0-9]+)\.([0-9]+).*/release-\1.\2/')
+
+#ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
+ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
+  [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
+  printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
+
+GOLANGCI_LINT_VERSION ?= v2.5.0
+.PHONY: kustomize
+kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
+$(KUSTOMIZE): $(LOCALBIN)
+	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
+
+.PHONY: controller-gen
+controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
+$(CONTROLLER_GEN): $(LOCALBIN)
+	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
+
+.PHONY: setup-envtest
+setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
+	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
+	@"$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path || { \
+		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
+		exit 1; \
+	}
+
+.PHONY: envtest
+envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
+$(ENVTEST): $(LOCALBIN)
+	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
+
+.PHONY: golangci-lint
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary
+# $2 - package url which can be installed
+# $3 - specific version of package
+define go-install-tool
+@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+rm -f "$(1)" ;\
+GOBIN="$(LOCALBIN)" go install $${package} ;\
+mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
+} ;\
+ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
+endef
+
+define gomodver
+$(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
+endef
+
+
+================================================================================
+FILE: ./internal/controller/webapp_controller_test.go
+================================================================================
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	kleffv1 "kleff.io/api/v1"
+)
+
+var _ = Describe("WebApp Controller", func() {
+	Context("When reconciling a resource", func() {
+		const resourceName = "test-resource"
+
+		ctx := context.Background()
+
+		typeNamespacedName := types.NamespacedName{
+			Name:      resourceName,
+			Namespace: "default", // TODO(user):Modify as needed
+		}
+		webapp := &kleffv1.WebApp{}
+
+		BeforeEach(func() {
+			By("creating the custom resource for the Kind WebApp")
+			err := k8sClient.Get(ctx, typeNamespacedName, webapp)
+			if err != nil && errors.IsNotFound(err) {
+				resource := &kleffv1.WebApp{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      resourceName,
+						Namespace: "default",
+					},
+					// TODO(user): Specify other spec details if needed.
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			// TODO(user): Cleanup logic after each test, like removing the resource instance.
+			resource := &kleffv1.WebApp{}
+			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Cleanup the specific resource instance WebApp")
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+		})
+		It("should successfully reconcile the resource", func() {
+			By("Reconciling the created resource")
+			controllerReconciler := &WebAppReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
+			// Example: If you expect a certain status condition after reconciliation, verify it here.
+		})
+	})
+})
+
+
+================================================================================
+FILE: ./internal/controller/webapp_controller.go
+================================================================================
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"regexp" 
+	"strings"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	// Import Gateway API types
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	kleffv1 "kleff.io/api/v1"
+)
+
+type WebAppReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+//+kubebuilder:rbac:groups=kleff.kleff.io,resources=webapps,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=kleff.kleff.io,resources=webapps/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
+func (r *WebAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// 1. Fetch the WebApp CR
+	webapp := &kleffv1.WebApp{}
+	err := r.Get(ctx, req.NamespacedName, webapp)
+	if err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// --- DEFINE LABELS ---
+	// "app" is the UUID (webapp.Name). 
+	// We add "display-name" for human observability via kubectl.
+	labels := map[string]string{
+		"app":          webapp.Name, // This is the UUID
+		"container-id": webapp.Spec.ContainerID,
+		"controller":   "webapp",
+	}
+	if webapp.Spec.DisplayName != "" {
+		// Sanitize display name for label safety (max 63 chars, alphanumeric)
+		safeDisplayName := regexp.MustCompile(`[^a-z0-9A-Z._-]`).ReplaceAllString(webapp.Spec.DisplayName, "-")
+		labels["display-name"] = safeDisplayName
+	}
+
+	// 2. Sync Deployment
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      webapp.Name, // UUID
+			Namespace: webapp.Namespace,
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+		deployment.Labels = labels
+
+		// Selector is immutable after creation, so we set it only if new
+		if deployment.CreationTimestamp.IsZero() {
+			deployment.Spec.Selector = &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": webapp.Name},
+			}
+		}
+
+		replicas := int32(1)
+		deployment.Spec.Replicas = &replicas
+
+		// Pod Template
+		if deployment.Spec.Template.ObjectMeta.Labels == nil {
+			deployment.Spec.Template.ObjectMeta.Labels = make(map[string]string)
+		}
+		for k, v := range labels {
+			deployment.Spec.Template.ObjectMeta.Labels[k] = v
+		}
+
+		deployment.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: "acr-creds"},
+		}
+
+		// Environment Variables
+		var envVars []corev1.EnvVar
+		for key, value := range webapp.Spec.EnvVariables {
+			envVars = append(envVars, corev1.EnvVar{Name: key, Value: value})
+		}
+
+		deployment.Spec.Template.Spec.Containers = []corev1.Container{{
+			Name:            "app",
+			Image:           webapp.Spec.Image,
+			ImagePullPolicy: corev1.PullAlways,
+			Env:             envVars,
+			Ports: []corev1.ContainerPort{{
+				Name:          "http",
+				ContainerPort: int32(webapp.Spec.Port),
+				Protocol:      corev1.ProtocolTCP,
+			}},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(webapp.Spec.Port)},
+				},
+			},
+		}}
+
+		return controllerutil.SetControllerReference(webapp, deployment, r.Scheme)
+	})
+
+	if err != nil {
+		logger.Error(err, "Failed to reconcile Deployment")
+		return r.updateStatus(ctx, webapp, metav1.ConditionFalse, "DeploymentFailed", err.Error())
+	}
+
+	// 3. Sync Service
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      webapp.Name, // UUID
+			Namespace: webapp.Namespace,
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, service, func() error {
+		service.Labels = labels
+		service.Spec.Selector = map[string]string{"app": webapp.Name}
+		service.Spec.Type = corev1.ServiceTypeClusterIP
+		service.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       80,
+			TargetPort: intstr.FromInt(webapp.Spec.Port),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		return controllerutil.SetControllerReference(webapp, service, r.Scheme)
+	})
+
+	if err != nil {
+		return r.updateStatus(ctx, webapp, metav1.ConditionFalse, "ServiceFailed", err.Error())
+	}
+
+	// 4. Sync HTTPRoute (Envoy Gateway)
+	httpRoute := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      webapp.Name + "-route", // UUID-route
+			Namespace: webapp.Namespace,
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, httpRoute, func() error {
+		if httpRoute.Annotations == nil {
+			httpRoute.Annotations = make(map[string]string)
+		}
+		// ExternalDNS targets
+		httpRoute.Annotations["external-dns.alpha.kubernetes.io/target"] = "66.130.187.229"
+		httpRoute.Annotations["external-dns.alpha.kubernetes.io/cloudflare-proxied"] = "false"
+		httpRoute.Annotations["external-dns.alpha.kubernetes.io/ttl"] = "3600"
+
+		gwNamespace := gatewayv1.Namespace("envoy-gateway-system")
+		httpRoute.Spec.CommonRouteSpec.ParentRefs = []gatewayv1.ParentReference{
+			{
+				Name:      "prod-web",
+				Namespace: &gwNamespace,
+			},
+		}
+
+		// THE SUBDOMAIN: Using webapp.Name (UUID)
+		hostname := gatewayv1.Hostname(fmt.Sprintf("%s.kleff.io", webapp.Name))
+		httpRoute.Spec.Hostnames = []gatewayv1.Hostname{hostname}
+
+		// POINT TO BACKEND: Points to the Service named with the UUID
+		port := gatewayv1.PortNumber(80)
+		httpRoute.Spec.Rules = []gatewayv1.HTTPRouteRule{
+			{
+				BackendRefs: []gatewayv1.HTTPBackendRef{
+					{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Name: gatewayv1.ObjectName(webapp.Name), // UUID Service
+								Port: &port,
+							},
+						},
+					},
+				},
+			},
+		}
+
+		return controllerutil.SetControllerReference(webapp, httpRoute, r.Scheme)
+	})
+
+	if err != nil {
+		logger.Error(err, "Failed to reconcile HTTPRoute")
+		return r.updateStatus(ctx, webapp, metav1.ConditionFalse, "HTTPRouteFailed", err.Error())
+	}
+
+	// 5. Update Status based on Deployment Readiness
+	if deployment.Status.ReadyReplicas > 0 {
+		msg := fmt.Sprintf("WebApp is running at http://%s.kleff.io", webapp.Name)
+		return r.updateStatus(ctx, webapp, metav1.ConditionTrue, "Available", msg)
+	} else {
+		return r.updateStatus(ctx, webapp, metav1.ConditionFalse, "Progressing", "Waiting for pods to be ready")
+	}
+}
+
+func (r *WebAppReconciler) updateStatus(ctx context.Context, webapp *kleffv1.WebApp, status metav1.ConditionStatus, reason, message string) (ctrl.Result, error) {
+	currentCond := meta.FindStatusCondition(webapp.Status.Conditions, "Available")
+
+	if currentCond != nil &&
+		currentCond.Status == status &&
+		currentCond.Reason == reason &&
+		currentCond.Message == message {
+		return ctrl.Result{}, nil
+	}
+
+	meta.SetStatusCondition(&webapp.Status.Conditions, metav1.Condition{
+		Type:               "Available",
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	})
+
+	if err := r.Status().Update(ctx, webapp); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *WebAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&kleffv1.WebApp{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&gatewayv1.HTTPRoute{}).
+		Complete(r)
+}
+
+
+================================================================================
+FILE: ./internal/controller/suite_test.go
+================================================================================
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	kleffv1 "kleff.io/api/v1"
+	// +kubebuilder:scaffold:imports
+)
+
+// These tests use Ginkgo (BDD-style Go testing framework). Refer to
+// http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
+
+var (
+	ctx       context.Context
+	cancel    context.CancelFunc
+	testEnv   *envtest.Environment
+	cfg       *rest.Config
+	k8sClient client.Client
+)
+
+func TestControllers(t *testing.T) {
+	RegisterFailHandler(Fail)
+
+	RunSpecs(t, "Controller Suite")
+}
+
+var _ = BeforeSuite(func() {
+	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
+
+	ctx, cancel = context.WithCancel(context.TODO())
+
+	var err error
+	err = kleffv1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
+	// +kubebuilder:scaffold:scheme
+
+	By("bootstrapping test environment")
+	testEnv = &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+	}
+
+	// Retrieve the first found binary directory to allow running tests from IDEs
+	if getFirstFoundEnvTestBinaryDir() != "" {
+		testEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
+	}
+
+	// cfg is defined in this file globally.
+	cfg, err = testEnv.Start()
+	Expect(err).NotTo(HaveOccurred())
+	Expect(cfg).NotTo(BeNil())
+
+	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(k8sClient).NotTo(BeNil())
+})
+
+var _ = AfterSuite(func() {
+	By("tearing down the test environment")
+	cancel()
+	err := testEnv.Stop()
+	Expect(err).NotTo(HaveOccurred())
+})
+
+// getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
+// ENVTEST-based tests depend on specific binaries, usually located in paths set by
+// controller-runtime. When running tests directly (e.g., via an IDE) without using
+// Makefile targets, the 'BinaryAssetsDirectory' must be explicitly configured.
+//
+// This function streamlines the process by finding the required binaries, similar to
+// setting the 'KUBEBUILDER_ASSETS' environment variable. To ensure the binaries are
+// properly set up, run 'make setup-envtest' beforehand.
+func getFirstFoundEnvTestBinaryDir() string {
+	basePath := filepath.Join("..", "..", "bin", "k8s")
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		logf.Log.Error(err, "Failed to read directory", "path", basePath)
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			return filepath.Join(basePath, entry.Name())
+		}
+	}
+	return ""
+}
+
+
+================================================================================
+FILE: ./.golangci.yml
+================================================================================
+
+version: "2"
+run:
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - dupl
+    - errcheck
+    - ginkgolinter
+    - goconst
+    - gocyclo
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    revive:
+      rules:
+        - name: comment-spacings
+        - name: import-shadowing
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - lll
+        path: api/*
+      - linters:
+          - dupl
+          - lll
+        path: internal/*
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+
+================================================================================
+FILE: ./PROJECT
+================================================================================
+
+# Code generated by tool. DO NOT EDIT.
+# This file is used to track the info used to scaffold your project
+# and allow the plugins properly work.
+# More info: https://book.kubebuilder.io/reference/project-config.html
+cliVersion: 4.10.1
+domain: kleff.io
+layout:
+- go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: dist
+projectName: operator
+repo: kleff.io
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: kleff.io
+  group: kleff
+  kind: WebApp
+  path: kleff.io/api/v1
+  version: v1
+version: "3"
+
+
+================================================================================
+FILE: ./.github/workflows/test-chart.yml
+================================================================================
+
+name: Test Chart
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-e2e:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Create kind cluster
+        run: kind create cluster
+
+      - name: Prepare operator
+        run: |
+          go mod tidy
+          make docker-build IMG=operator:v0.1.0
+          kind load docker-image operator:v0.1.0
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Verify Helm installation
+        run: helm version
+
+      - name: Lint Helm Chart
+        run: |
+          helm lint ./dist/chart
+
+# TODO: Uncomment if cert-manager is enabled
+#      - name: Install cert-manager via Helm (wait for readiness)
+#        run: |
+#          helm repo add jetstack https://charts.jetstack.io
+#          helm repo update
+#          helm install cert-manager jetstack/cert-manager \
+#            --namespace cert-manager \
+#            --create-namespace \
+#            --set crds.enabled=true \
+#            --wait \
+#            --timeout 300s
+
+# TODO: Uncomment if Prometheus is enabled
+#      - name: Install Prometheus Operator CRDs
+#        run: |
+#          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#          helm repo update
+#          helm install prometheus-crds prometheus-community/prometheus-operator-crds
+
+      - name: Install Helm chart for project
+        run: |
+          helm install my-release ./dist/chart --create-namespace --namespace operator-system
+
+      - name: Check Helm release status
+        run: |
+          helm status my-release --namespace operator-system
+
+
+================================================================================
+FILE: ./.github/workflows/lint.yml
+================================================================================
+
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run linter
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+
+
+================================================================================
+FILE: ./.github/workflows/test.yml
+================================================================================
+
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Running Tests
+        run: |
+          go mod tidy
+          make test
+
+
+================================================================================
+FILE: ./.github/workflows/test-e2e.yml
+================================================================================
+
+name: E2E Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-e2e:
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Running Test e2e
+        run: |
+          go mod tidy
+          make test-e2e
+
+
+================================================================================
+FILE: ./api/v1/webapp_types.go
+================================================================================
+
+/*
+Copyright 2025.
+*/
+
+package v1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// WebAppSpec defines the desired state of WebApp
+type WebAppSpec struct {
+	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+	
+	// +kubebuilder:validation:MinLength=1
+	DisplayName string `json:"displayName,omitempty"`
+
+	// ADDED: The UUID from the build request
+	ContainerID string `json:"containerID,omitempty"`
+
+	RepoURL     string `json:"repoURL,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	
+	// +kubebuilder:validation:Required
+	Image string `json:"image,omitempty"`
+	
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:default=8080
+	Port int `json:"port,omitempty"`
+	
+	// +optional
+	EnvVariables map[string]string `json:"envVariables,omitempty"`
+}
+
+// WebAppStatus defines the observed state of WebApp.
+type WebAppStatus struct {
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+
+// WebApp is the Schema for the webapps API
+type WebApp struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitzero"`
+
+	// +required
+	Spec WebAppSpec `json:"spec"`
+
+	// +optional
+	Status WebAppStatus `json:"status,omitzero"`
+}
+
+// +kubebuilder:object:root=true
+
+// WebAppList contains a list of WebApp
+type WebAppList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitzero"`
+	Items           []WebApp `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&WebApp{}, &WebAppList{})
+}
+
+================================================================================
+FILE: ./api/v1/groupversion_info.go
+================================================================================
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package v1 contains API Schema definitions for the kleff v1 API group.
+// +kubebuilder:object:generate=true
+// +groupName=kleff.kleff.io
+package v1
+
+import (
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
+)
+
+var (
+	// GroupVersion is group version used to register these objects.
+	GroupVersion = schema.GroupVersion{Group: "kleff.kleff.io", Version: "v1"}
+
+	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
+	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+
+	// AddToScheme adds the types in this group-version to the given scheme.
+	AddToScheme = SchemeBuilder.AddToScheme
+)
+
+
+================================================================================
+FILE: ./api/v1/zz_generated.deepcopy.go
+================================================================================
+
+//go:build !ignore_autogenerated
+
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Code generated by controller-gen. DO NOT EDIT.
+
+package v1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtime "k8s.io/apimachinery/pkg/runtime"
+)
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WebApp) DeepCopyInto(out *WebApp) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	in.Spec.DeepCopyInto(&out.Spec)
+	in.Status.DeepCopyInto(&out.Status)
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WebApp.
+func (in *WebApp) DeepCopy() *WebApp {
+	if in == nil {
+		return nil
+	}
+	out := new(WebApp)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
+func (in *WebApp) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WebAppList) DeepCopyInto(out *WebAppList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		in, out := &in.Items, &out.Items
+		*out = make([]WebApp, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WebAppList.
+func (in *WebAppList) DeepCopy() *WebAppList {
+	if in == nil {
+		return nil
+	}
+	out := new(WebAppList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyObject is an autogenerated deepcopy function, copying the receiver, creating a new runtime.Object.
+func (in *WebAppList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WebAppSpec) DeepCopyInto(out *WebAppSpec) {
+	*out = *in
+	if in.EnvVariables != nil {
+		in, out := &in.EnvVariables, &out.EnvVariables
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WebAppSpec.
+func (in *WebAppSpec) DeepCopy() *WebAppSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(WebAppSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *WebAppStatus) DeepCopyInto(out *WebAppStatus) {
+	*out = *in
+	if in.Conditions != nil {
+		in, out := &in.Conditions, &out.Conditions
+		*out = make([]metav1.Condition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+}
+
+// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WebAppStatus.
+func (in *WebAppStatus) DeepCopy() *WebAppStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(WebAppStatus)
+	in.DeepCopyInto(out)
+	return out
+}

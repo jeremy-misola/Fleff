@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- kleff_v1_webapp.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
