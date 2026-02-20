@@ -33,6 +33,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	postgresv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -51,8 +52,10 @@ func init() {
 
 	utilruntime.Must(kleffv1.AddToScheme(scheme))
 
-	// ADD THIS HERE: Register Istio types before the manager starts
+	// Register Gateway API types
 	utilruntime.Must(gatewayv1.AddToScheme(scheme))
+	// Register CloudNativePG types
+	utilruntime.Must(postgresv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
